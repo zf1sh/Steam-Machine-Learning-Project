@@ -1,0 +1,88 @@
+app_id
+Integer
+Unique identifier for each application
+
+name
+String
+Name of the application
+
+price
+Float
+Base price of the game in USD
+
+estimated_owners
+Factor
+Estimated number range of users who own the game
+
+genres
+String
+Broad game classifications or categories.
+
+categories
+String
+Operational categories / features supported
+
+tags
+String
+User-defined  keywords describing the game's attributes and themes
+
+positive
+Integer
+Total number of positive user reviews
+
+negative
+Integer
+Total number of negative user reviews
+
+peak_ccu
+Integer
+Peak concurrent user count recorded for the game
+
+average_playtime_forever
+Integer
+Average playtime recorded per user across the lifetime of the game
+
+median_playtime_forever
+Integer
+Median playtime recorded per user across the lifetime of the game
+
+average_playtime_2weeks
+Integer
+Average playtime recorded per user over the last two weeks (at the time of dataset retrieval)
+
+median_playtime_2weeks
+Integer
+Median playtime recorded per user over the last two weeks (at the time of dataset retrieval)
+
+achievements
+Integer
+Total count of achievements available within the game
+
+dlc_count
+Integer
+Total number of downloadable content (DLC) packages available for purchase
+
+supported_languages
+String
+List of individual languages natively supported in-game
+
+windows
+Boolean
+Flag indicating compatibility with Microsoft Windows operating systems
+
+mac
+Boolean
+Flag indicating compatibility with Apple macOS operating systems
+
+linux
+Boolean
+Flag indicating compatibility with Linux operating systems
+
+total_reviews
+Integer
+Aggregate count summing all submitted positive and negative user reviews
+
+pos_neg_ratio
+Float
+Ratio calculation evaluating positive reviews relative to negative feedback
+
