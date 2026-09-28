@@ -1,0 +1,782 @@
+---
+title: "Predicting Video Game Review Scores"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+library(tidyverse)
+library(tidymodels)
+library(corrplot)
+library(dplyr)
+library(purrr)
+library(jsonlite)
+library(vip)
+library(Hmisc)
+library(ggthemes)
+library(kableExtra)
+library(textrecipes)
+library(recipes)
+library(performance)
+library(glmnet)
+library(kknn)
+library(naniar)
+library(janitor)
+library(dials)
+library(ranger)
+library(patchwork)
+library(xgboost)
+library(doParallel) #i am speed...
+conflicted::conflicts_prefer(yardstick::rmse)
+conflicted::conflicts_prefer(yardstick::mae)
+tidymodels_prefer()
+setwd("~/PSTAT 131")
+set.seed(1214)
+clean <- read_rds(file = '~/PSTAT 131/clean.rds')
+```
+
+```{r, include = FALSE, eval = FALSE}
+cl <- makeCluster(detectCores() - 1) 
+registerDoParallel(cl)
+```
+
+# Introduction
+
+The purpose of this project is to try to develop a regression model that can reliably predict the ratio of positive to negative reviews on any given Steam video game.
+
+### Background
+
+Steam is a popular PC gaming platform in which video games and software are sold digitally. The data set I will be utilizing was scraped / retrieved from the Steam API and Steam Spy, but I acquired it from Kaggle. It is updated every two weeks, so the size of the data set can vary, but at the time of loading (some time around mid August of 2026) it has 137,559 observations, and 42 columns (before processing). The details of each of these predictors can be found here on Kaggle: <https://www.kaggle.com/datasets/fronkongames/steam-games-dataset?select=games.csv>
+
+*If looking at the original data set, I would strongly recommend looking on Kaggle instead of loading it in. Due to its size it takes quite a while to load.*
+
+For a more concise version of this info only explaining the variables kept for this project, consult the attached code book.
+
+### The Why
+
+Trying to predict any sort of pattern related to people's opinions can seem daunting and almost impossible. Opinions will inherently vary significantly, and to make matters worse, gamers can be super picky about certain parts of a game. Any little feature (or lack of a feature) can completely change somebody's opinion of a game. On top of this, the massive size of Steam's user base (over 200 million monthly active users, according to Steam), would make this task seem even more difficult to achieve. I want to try and demystify what gamers tend to like and dislike to the best of my ability.
+
+### The How
+
+As mentioned previously, we will be fitting a series of models attempting to predict how much people like (or dislike) a game. I will be doing this with regression as opposed to classification. It may seem easier to try and predict simply if a game will have more positive or negative reviews as a classification problem, and that would absolutely be correct. But, this broad of a scope would completely eliminate the question of *how* *much* people like or dislike a given game. I specifically wanted to be able to predict the magnitude of the opinion of a game.
+
+Before doing any analysis on the data set, it is clear that some of the columns may be more useful than others. The standout example of this would be the genres, tags, and categories columns. Each of these effectively contain a description of each game, condensed in a way that we can actually use. In the pre-processed data set there actually was a description column, but trying to implement string splitting methods to make it useful would prove incredibly arduous, and I personally doubt it would supply much more info than what is already in the three previously mentioned categorical variables.
+
+Finally, our actual outcome will be a ratio of positive to negative reviews. I constructed this as the positive reviews minus negative reviews, divided by the total reviews. This leaves us with a ratio that ranges from -1 to 1, where -1 would be all negative reviews, and 1 would be all positive reviews.
+
+# Data Wrangling and EDA
+
+Before we get started with any EDA, we need to clean up the data set. First, lets drop some of the most obvious unnecessary columns, then filter out un-played games, as well as games with unreasonably high pricing (over \$125.) In my opinion this value could probably be even lower, but just in case we'll set it a bit high. Some of the columns kept here I did not end up using for the models, but I felt that they *may* have ended up having a use, depending on the model type and performance.
+
+*Note: Most titles that ended up being over the price threshold were not even games, but software. BUT, for some reason there were some games that were \$200 for no reason (I checked Steam myself). I have no explanation for this. Either way, both the software and overpriced game issue are addressed later.*
+
+But, before we do anything to the data, lets take a look at how much of it is missing.
+
+```{r check-missingness1, eval=FALSE}
+steam_games <- read.csv('steam_games.csv', stringsAsFactors=FALSE)
+steam_games |> filter(if_any(everything(), is.na)) |> count() |> print()
+```
+
+We have 34401 rows with at at least one missing value. Quite a bit. But, this should go down significantly after we eliminate unnecessary columns and filter out a lot of junk. Lets do that here.
+
+```{r, eval = FALSE}
+filtered_steam_games <- steam_games |>
+  select(-user_score,
+         -price_status,
+         -recommendations,
+         -full_audio_languages,
+         -(short_description:notes),
+         -packages,
+         -(header_image:steam_spy_available), 
+         -metacritic_score) |>
+  filter(price < 125) |>
+  filter(average_playtime_forever > 0) |>
+  filter((positive&negative) != 0) #filtering out games with no reviews at all
+
+#Relevel estimated owners
+est_owner_levels <- c('0 - 20000',
+                      '20000 - 50000',
+                      '50000 - 100000',
+                      '100000 - 200000',
+                      '200000 - 500000',
+                      '500000 - 1000000',
+                      '1000000 - 2000000',
+                      '2000000 - 5000000',
+                      '5000000 - 10000000',
+                      '10000000 - 20000000',
+                      '20000000 - 50000000',
+                      '100000000 - 200000000')
+
+filtered_steam_games$estimated_owners <- filtered_steam_games$estimated_owners |>
+  factor(levels = est_owner_levels)
+
+#Set up a ratio for positive to negative review (-1 to 1, -1 being all negative, 1 being all positive)
+filtered_steam_games <- filtered_steam_games |>
+  mutate(total_reviews = (positive + negative),
+         pos_neg_ratio = (positive - negative) / total_reviews,
+         positive = positive / total_reviews, #set up pos and neg as ratios too
+         negative = negative / total_reviews)
+```
+
+Looking closely at the code, you may notice that the first column removed is "user_score." This may seem like a mistake, but there is actually a reason for this.
+
+Aside from the weird values in the column, the Steam user score is notoriously wonky. Some would even argue its broken. (There is actually an article on this, you can read it here: <https://www.fortressofdoors.com/fixing-steams-user-rating-charts/>) This can be seen for almost any observation with a user score of 0. Many of these observations do have a number of reviews, but they are not reflected in any way on the user score value. Another part of this is that user score may be based on an algorithm set up by Steam, and given the shakiness of its reliability, I'm choosing to exclude it. In the future I will do more research on the user score algorithm and whether it is viable as a predictor here.
+
+Similarly, the recommendations column is also removed. This column seems to have no relation to the number of positive or negative reviews. It isn't a total, and Steam itself doesn't really have a feature that seems like it lines up with this. (from my own observation.)
+
+Now, lets deal with the string splitting of categorical variables. In their current state there is no way to differentiate between any individual item in a given cell. We will change each of the lists in each cell to where each individual item separated is by a space, and multiple word items are separated by a '-'. This will let us dummy encode these later.
+
+```{r data-wrangling-json, eval=FALSE}
+cleaner <- function(x) {
+  clean_names <- str_replace_all(x, "[ -]", "_")
+  paste(clean_names, collapse = " ")
+}
+
+clean <- filtered_steam_games |> #Applying cleaner to all categorical variables
+  mutate(
+    genres = sapply(lapply(genres, fromJSON), cleaner),
+    developers = sapply(lapply(developers, fromJSON), cleaner),
+    publishers = sapply(lapply(publishers, fromJSON), cleaner),
+    categories = sapply(lapply(categories, fromJSON), cleaner),
+    tags = sapply(lapply(tags, fromJSON), cleaner),
+    supported_languages = sapply(lapply(supported_languages, fromJSON), cleaner))
+```
+
+We also need to filter out the observations that are not games (like software). The non-game titles proved to be an issue due to being vastly more expensive than a game on average, and don't concern my predictions regardless.
+
+```{r data-wrangling-genres, eval = FALSE}
+bad_genres <- c("Animation_&_Modeling",
+                "Video_Production",
+                "Audio_Production",
+                "Software_Training",
+                "Utilities",
+                "Design_&_Illustration",
+                "Photo_Editing",
+                "Game_Development",
+                "Web_Publishing",
+                "Movie","Documentary",
+                "Episodic",
+                "Short",
+                "Tutorial",
+                "360_Video")
+pattern <- (paste(bad_genres, collapse = '|'))
+clean <- clean[!grepl(pattern, clean$genres), ]
+```
+
+Now, let's count missing values again in our clean data set.
+
+```{r missingness2}
+clean |> filter(if_any(everything(), is.na)) |> count() |> print()
+```
+
+That's looking a lot better.
+
+```{r}
+clean |> filter(if_any(everything(), is.na)) |> head()
+clean <- clean |> drop_na()
+```
+
+If we take a look, all 4 observations are missing their "estimated_owners" info. Given the size of the data set, we can definitely afford to just drop them.
+
+## EDA
+
+Now that the data set is usable for our purposes, lets do some further EDA.
+
+First, we'll set up our train and testing split.
+
+```{r split}
+split <- initial_split(clean, prop = .7, strata = pos_neg_ratio)
+train <- training(split)
+test <- testing(split)
+```
+
+Next we'll take a look at how many of each genre there is. This code also sets up some data frames for the tags and categories variables that we can use for our EDA.
+
+```{r data-wrangling-vectors, eval=TRUE}
+all_genres <- sapply(clean$genres, str_split, pattern = ' ') |> unlist() |> unique() |> as.vector()
+all_tags <- sapply(clean$tags, str_split, pattern = ' ') |> unlist() |> unique() |> as.vector()
+all_cats <- sapply(clean$categories, str_split, pattern = ' ') |> unlist() |> unique() |> as.vector()
+
+#Func for getting counts of each category in a given cell (number of obs with "Single-player", etc.)
+counter <- function(x,y) {clean |> filter(grepl(x, y)) |> count()}
+
+tags_df <- all_tags |> sapply(counter, y = clean$tags) |>
+  as.data.frame() |> pivot_longer(everything())
+cats_df <- all_cats |> sapply(counter, y = clean$categories) |>
+  as.data.frame() |> pivot_longer(everything())
+genres_df <- all_genres |> sapply(counter, y=clean$genres) |>
+  as.data.frame() |> pivot_longer(everything()) |>
+  filter(name != 'n')
+```
+
+Here is a plot showing the quantity of each genre throughout the data set. Note that each game can have multiple genres.
+
+```{r, eval = TRUE}
+#Genre Counts
+ggplot(data = genres_df, aes(x = value, y = name)) +
+  geom_segment(aes(x = 0, xend = value, y = name, yend = name),
+               color = 'black', linewidth = .8) +
+  geom_count(size = 2) +
+  labs(x = 'Count', y = 'Genres', title = 'Genre Counts')
+```
+
+Now, lets take a look at the distribution of reviews for the training set. This is also color coded by our factor estimated_owners.
+
+```{r, bins}
+train <- train %>%
+  mutate(pos_neg_bin = cut(pos_neg_ratio, breaks = seq(-1, 1, length.out = 3))) %>% 
+  filter(!is.na(pos_neg_bin))
+```
+
+```{r eda-hist}
+ggplot(data = train, aes(x = pos_neg_ratio, fill = estimated_owners)) +
+  geom_histogram(binwidth = .009) + 
+  scale_fill_viridis_d(option = 'turbo') + 
+  labs(x = 'Positive to Negative Ratio', y = 'Count', title = 'Review Distribution with Estimated Owners')
+```
+
+It looks like its pretty heavily skewed left, so significantly more overall positive games than negative. Why?
+
+Generally, people are not going to buy or play games they don't want. Other people leaving reviews further supports this idea. If other people don't like it, people won't buy it. Thus, there would be a sort of feedback loop of positive reviews.
+
+Now lets take a look at the distribution of prices, color coded by general positivity or negativity.
+
+```{r eda-price}
+ggplot(data = train |> arrange(price), aes(x = price, fill = pos_neg_bin)) +
+  geom_histogram(binwidth = 3) + 
+  labs(x = 'Price', y = 'Count', title = 'Price Distribution with Overall Positivity / Negativity', fill = 'Majority Negative / Positive')
+```
+
+Looks like most games are less than \$25, and most of the games with more negative than positive reviews are in the same range.
+
+```{r}
+train <- train |> select(-pos_neg_bin) #take out binned pos_neg_ratio column
+```
+
+Lets also look at our correlation plot for our numeric variables. This is excluding variables with direct or relatively strong collinearity, and also has a filter for minimum and maximum correlation. Later, after we dummy encode our categorical variables, this filter prove to be incredibly useful.
+
+```{r eda-corr}
+cor <- train[sapply(train, is.numeric)] |> select(-median_playtime_forever, -median_playtime_2weeks, -positive, - negative, -app_id) |> cor()
+
+high_corr <- apply(cor, 1, function(x) any(abs(x) > 0.05 & x < 1))
+filtered_cor <- cor[high_corr, high_corr]
+corrplot <- filtered_cor |> corrplot(type = 'lower', method = "color", order = 'hclust', tl.cex = .7, diag = FALSE, tl.srt = 45)
+```
+
+This shows a slight correlation between hours played and positive reviews. Thus, a slight negative correlation between hours played and negative reviews as well. Other than that, there is nothing all too surprising here. More reviews = more playtime = more reviews... etc. The slight negative correlation between price and our positive to negative ratio is a bit interesting, though.
+
+# Model Fitting
+
+Now that we've inspected the data, we can start fitting some models. Before we do that, lets establish a little recipe book.
+
+### Recipes
+
+First, we have our general use recipe.
+
+```{r recipe-general}
+recipe <- recipe(pos_neg_ratio ~ ., data = train) |> 
+  step_rm(positive, negative, windows, mac, linux, app_id, release_date, publishers, developers, name) |> 
+  #incredibly arduous dummy encoding here...
+  step_dummy(estimated_owners) |>
+  step_tokenize(genres, options = list(lowercase = FALSE)) |> 
+  step_tokenize(categories, options = list(lowercase = FALSE)) |> 
+  step_tokenize(tags, options = list(lowercase = FALSE)) |> 
+  step_tokenize(supported_languages, options = list(lowercase = FALSE)) |> 
+  #separated each tokenize step so max_tokens can be changed if needed
+  step_tokenfilter(genres) |> 
+  step_tokenfilter(categories) |> 
+  step_tokenfilter(tags) |> 
+  step_tokenfilter(supported_languages) |> 
+  
+  step_tf(genres, weight_scheme = 'binary') |> 
+  step_tf(categories, weight_scheme = 'binary') |> 
+  step_tf(tags, weight_scheme = 'binary') |> 
+  step_tf(supported_languages, weight_scheme = 'binary') |> 
+  step_zv(all_numeric_predictors()) |> 
+  #Deal with collinearity
+  step_lincomb(all_numeric_predictors()) |> 
+  step_corr(all_numeric_predictors(), threshold = 0.9) |>
+  #Normalization
+  step_center(all_numeric_predictors(), -all_outcomes()) |> 
+  step_scale(all_numeric_predictors(), -all_outcomes())
+```
+
+Lets set up a little prep and bake to make sure everything looks good.
+
+```{r recipe-general-check}
+prep(recipe) |>
+  bake(new_data = train) |>
+  head() |>
+  kable() |>
+  kable_styling(full_width = F) |>
+  scroll_box(width = "100%", height = "200px")
+```
+
+This will be our KNN with PCA recipe.
+
+```{r recipe-knn}
+recipe_knn <- recipe(pos_neg_ratio ~ ., data = train) |> 
+  step_rm(positive, negative, windows, mac, linux, app_id, release_date, publishers, developers, name) |> 
+  #incredibly arduous dummy encoding here...
+  step_dummy(estimated_owners) |>
+  step_tokenize(genres, options = list(lowercase = FALSE)) |> 
+  step_tokenize(categories, options = list(lowercase = FALSE)) |> 
+  step_tokenize(tags, options = list(lowercase = FALSE)) |> 
+  step_tokenize(supported_languages, options = list(lowercase = FALSE)) |> 
+  
+  step_tokenfilter(genres) |> 
+  step_tokenfilter(categories) |> 
+  step_tokenfilter(tags) |> 
+  step_tokenfilter(supported_languages) |> 
+  
+  step_tf(genres, weight_scheme = 'binary') |> 
+  step_tf(categories, weight_scheme = 'binary') |> 
+  step_tf(tags, weight_scheme = 'binary') |> 
+  step_tf(supported_languages, weight_scheme = 'binary') |> 
+  step_zv(all_numeric_predictors()) |> 
+  #Normalization
+  step_center(all_numeric_predictors(), -all_outcomes()) |> 
+  step_scale(all_numeric_predictors(), -all_outcomes()) |>
+  step_pca(all_predictors(), threshold = .75) #not tuning number of components for simplicity, may return to later
+```
+
+Here is our elastic recipe. Its the same as our general use recipe, just removes the lincomb and corr steps, as they are unnecessary for this model.
+
+```{r recipe-elastic}
+recipe_elastic <- recipe(pos_neg_ratio ~ ., data = train) |> 
+  step_rm(positive, negative, windows, mac, linux, app_id, release_date, publishers, developers, name) |> 
+  step_dummy(estimated_owners) |>
+  step_tokenize(genres, options = list(lowercase = FALSE)) |> 
+  step_tokenize(categories, options = list(lowercase = FALSE)) |> 
+  step_tokenize(tags, options = list(lowercase = FALSE)) |> 
+  step_tokenize(supported_languages, options = list(lowercase = FALSE)) |> 
+  
+  step_tokenfilter(genres) |> 
+  step_tokenfilter(categories) |> 
+  step_tokenfilter(tags) |> 
+  step_tokenfilter(supported_languages) |> 
+  
+  step_tf(genres, weight_scheme = 'binary') |> 
+  step_tf(categories, weight_scheme = 'binary') |> 
+  step_tf(tags, weight_scheme = 'binary') |> 
+  step_tf(supported_languages, weight_scheme = 'binary') |> 
+  
+  step_zv(all_numeric_predictors()) |> 
+  
+  step_center(all_numeric_predictors(), -all_outcomes()) |> 
+  step_scale(all_numeric_predictors(), -all_outcomes())
+```
+
+Making sure everything looks okay again...
+
+```{r recipe-elastic-check, eval=FALSE}
+prep(recipe_elastic) |>
+  bake(new_data = train) |>
+  head() |>
+  kable() |>
+  kable_styling(full_width = F) |>
+  scroll_box(width = "100%", height = "200px")
+```
+
+And finally, our random forest / boosted tree recipe. This one differs from the others in removing the centering and scaling steps in addition to the lincomb and corr steps.
+
+```{r forest-recipe}
+recipe_forest <- recipe(pos_neg_ratio ~ ., data = train) |> 
+  step_rm(positive, negative, windows, mac, linux, app_id, release_date, publishers, developers, name) |> 
+  step_dummy(estimated_owners) |> 
+  step_tokenize(genres, options = list(lowercase = FALSE)) |> 
+  step_tokenize(categories, options = list(lowercase = FALSE)) |> 
+  step_tokenize(tags, options = list(lowercase = FALSE)) |> 
+  step_tokenize(supported_languages, options = list(lowercase = FALSE)) |> 
+  
+  step_tokenfilter(genres) |> 
+  step_tokenfilter(categories) |> 
+  step_tokenfilter(tags) |> 
+  step_tokenfilter(supported_languages) |> 
+  
+  step_tf(genres, weight_scheme = 'binary') |> 
+  step_tf(categories, weight_scheme = 'binary') |> 
+  step_tf(tags, weight_scheme = 'binary') |> 
+  step_tf(supported_languages, weight_scheme = 'binary') |> 
+  
+  step_zv(all_numeric_predictors())
+```
+
+Before we move into setting up models, lets take a look at the correlation plot, post dummy encoding. This lets us see the correlation between all the individual tags, genres, and categories. This isn't necessarily crucial for any of the predictions, but it is still fairly interesting. Notice that this plot only includes variables with +- .85 for correlation. This keeps the plot readable.
+
+```{r recipe-general-corr}
+cor  <- prep(recipe) |> bake(new_data = train) |> select(pos_neg_ratio, contains('tf')) |> select(!contains('languages')) |> cor() 
+high_corr <- apply(cor, 1, function(x) any(abs(x) > 0.85 & x < .9)) #super tight filter, or else the corrplot is unreadable with too many variables
+filtered_cor <- cor[high_corr, high_corr]
+corrplot <- filtered_cor |> corrplot(type = 'lower', method = "shade", order = 'hclust', tl.cex = .7, diag = FALSE, tl.srt = 45, col = COL2("PuOr"))
+```
+
+Again, this isn't exactly crucial to any predictions, and between the three variables there is a solid amount of overlap. but, there are still some interesting notes. For instance, any types of strategy or simulation indicators are negatively correlated with the action indicators. The plot also shows varying correlation between indicators related to accessibility and certain genres. This is most noticeable for RPGs in particular.
+
+## Linear Regression
+
+We are going to start simple with linear regression. I don't exactly think this model will do well, but it is worth trying. We're still going to use folds to improve performance.
+
+```{r lm-fit}
+lm_specs <- linear_reg() |> set_engine('lm') |> set_mode('regression')
+lm_flow <- workflow() |> add_recipe(recipe) |> add_model(lm_specs)
+control <- control_resamples(save_pred = TRUE)
+```
+
+```{r, eval = FALSE}
+lm_fit <- lm_flow |> fit_resamples(resamples = vfold_cv(train, v = 10, strata = pos_neg_ratio), 
+                                   control = control)
+write_rds(lm_fit, file = '~/PSTAT 131/lm_fit.rds')
+```
+
+Lets look at how well we did on the training set.
+
+```{r}
+lm_fit <- read_rds(file = '~/PSTAT 131/lm_fit.rds') #read in
+lm_metrics <- lm_fit |> collect_metrics()
+lm_metrics |> print()
+```
+
+```{r}
+ggplot(lm_fit |> collect_predictions(), aes(x = pos_neg_ratio, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(color = "red", linetype = "dashed") +
+  labs(x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
+This graph shows what our model predicted versus the actual values of the training set. The points should approximately follow the dotted red line, if the model predicts correctly. So, it looks like the model is predicted many more titles having more negative reviews than positive reviews. Overall, linear regression did not do too great.
+
+## KNN with PCA
+
+Now, lets try fitting KNN. I know KNN isn't typically the greatest with lots of predictors, so I decided to incorporate PCA.
+
+```{r knn-workflow}
+knn_specs <- nearest_neighbor(
+  neighbors = tune(), 
+  dist_power = 1,
+  weight_func = 'triangular') |>
+  set_engine("kknn") |> 
+  set_mode("regression")
+
+knn_flow <- workflow() |> 
+  add_recipe(recipe_knn) |>
+  add_model(knn_specs)
+
+folds <- vfold_cv(train, v = 5, strata = pos_neg_ratio) #only 5 folds for computational efficiency
+```
+
+s
+
+```{r knn-tune, eval=FALSE}
+train |> nrow() |> sqrt() #taking sqrt of n to get a gauge of a good range for k
+k_grid <- grid_regular(neighbors(range = c(10, 120)), levels = 10)
+ktune_res <- tune_grid(object = knn_flow,
+                       resamples = folds,
+                       grid = k_grid,
+                       control = control_grid())
+write_rds(ktune_res, file = '~/PSTAT 131/knn.rds')
+```
+
+```{r knn-results, include=FALSE}
+ktune_res <- read_rds(file = '~/PSTAT 131/knn.rds')
+```
+
+Now that we fit the model, let's plot RMSE and RSQ.
+
+```{r knn-best}
+autoplot(ktune_res)
+
+k_best <- select_best(ktune_res, metric = "rmse")
+k_best |> print()
+```
+
+Looks like 46 is the best, according to the select_best and our autoplot.
+
+Lets fit the best model to the whole training set and check its performance
+
+```{r knn-fit, eval = FALSE}
+knn_final_flow <- finalize_workflow(knn_flow, k_best)
+knn_fit <- fit(knn_final_flow, train) |> augment(new_data = train)
+write_rds(knn_fit, file = '~/PSTAT 131/knn_fit.rds')
+```
+
+```{r knn-metrics}
+knn_fit <- read_rds(file = '~/PSTAT 131/knn_fit.rds')
+knn_metrics <- knn_fit |> metrics(truth = pos_neg_ratio, estimate = .pred)
+knn_metrics |> print()
+```
+
+```{r}
+ggplot(knn_fit, aes(x = pos_neg_ratio, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(color = "red", linetype = "dashed") +
+  labs(x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
+Our RSQ doubled between linear regression and this model. We're still only at 55.6%, though. Lets see if some more versatile models can help out here.
+
+## Elastic Net
+
+We're going to try an elastic net model instead. This will hopefully perform better than linear regression and KNN, since we will be tuning both mixture and penalty.
+
+```{r elastic-workflow}
+elastic_specs <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine('glmnet') |>
+  set_mode('regression')
+elastic_flow <- workflow() |> add_recipe(recipe_elastic) |>
+  add_model(elastic_specs)
+```
+
+```{r elastic-tune, eval=FALSE}
+elastic_grid <- grid_regular(penalty(range = c(-10, 0)),
+                             mixture(range = c(0,1)),
+                             levels = 10)
+elastic_res <- tune_grid(
+  elastic_flow,
+  resamples = folds,
+  grid = elastic_grid,
+  metrics = metric_set(rmse)
+)
+write_rds(elastic_res, file = '~/PSTAT 131/elastic.rds')
+```
+
+Now that our tuning grid is set up, lets see which hyper-parameter combination works the best.
+
+```{r elastic-results}
+elastic_res <- read_rds(file = '~/PSTAT 131/elastic.rds')
+autoplot(elastic_res)
+elastic_best <- select_by_one_std_err(elastic_res, 'rmse')
+elastic_best |> print()
+```
+
+Our best parameter combo ended up being with a mixture of 0 and a penalty of almost 0. The original range I had set for penalty only went down to -4. But, I noticed that when I dropped the range even lower to -6, the model preferred that penalty. After checking with a range that went all the way down to -10, I can be almost certain that OLS is better suited for this data.
+
+```{r elastic-fit, eval = FALSE}
+final_elastic_flow <- finalize_workflow(elastic_flow, elastic_best)
+elastic_fit <- fit(final_elastic_flow, train) |> augment(new_data = train)
+write_rds(elastic_fit, file = '~/PSTAT 131/elastic_fit.rds')
+```
+
+```{r elastic-metrics}
+elastic_fit <- read_rds(file = '~/PSTAT 131/elastic_fit.rds')
+
+elastic_metrics <- elastic_fit |> metrics(truth = pos_neg_ratio, estimate = .pred)
+elastic_metrics |> print()
+```
+
+```{r}
+ggplot(elastic_fit, aes(x = pos_neg_ratio, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(color = "red", linetype = "dashed") +
+  labs(x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
+It's not a big surprise that this model did not do well. It performed very similarly to the linear regression model, because with such a small penalty that is effectively what it was.
+
+## Random Forest
+
+Time to move on to some more versatile models.
+
+```{r forest-specs}
+forest_specs <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) |>
+  set_engine('ranger', importance = 'impurity') |>
+  set_mode('regression')
+
+forest_flow <- workflow() |> 
+  add_recipe(recipe_forest) |> 
+  add_model(forest_specs)
+```
+
+Before fitting this model, its important to try and find a good range for our tuning values. Specifically `mtry` in this case. I'll be using the "p/3" guideline here.
+
+```{r, eval = FALSE}
+prep(recipe_forest) |> bake(new_data = train) |> ncol() / 3
+prep(recipe_forest) |> bake(new_data = train) |> nrow() * .01
+```
+
+This gave us an `mtry` guideline of 98, which is *significantly* larger than what I had originally set for this model (2 to 25). Lets see if this leads to any improvements.
+
+```{r, eval = FALSE}
+forest_grid <- grid_regular(trees(range = c(50, 400)), mtry(range = c(45, 200)), min_n(range = c(2, 20)), levels = 5)
+
+forest_res <- tune_grid(forest_flow,
+                       resamples = folds,
+                       grid = forest_grid,
+                       metrics = metric_set(rmse, rsq))
+write_rds(forest_res, file = '~/PSTAT 131/forest.rds')
+```
+
+```{r forest-results}
+forest_res <- read_rds(file = '~/PSTAT 131/forest.rds') #read back in
+forest_best <- select_best(forest_res, metric = "rmse")
+forest_res |> autoplot()
+forest_best |> print()
+```
+
+It's hard to guess from the autoplot alone, but an `mtry` of 45, 312 `trees`, and a `min_n` of 2 was our best performer. Lets fit it to the training data.
+
+```{r, eval = FALSE}
+final_forest_flow <- finalize_workflow(forest_flow, forest_best)
+forest_fit <- fit(final_forest_flow, train)  |> augment(new_data = train)
+write_rds(forest_fit, file = '~/PSTAT 131/forest_fit.rds')
+```
+
+```{r}
+forest_fit <- read_rds(file = '~/PSTAT 131/forest_fit.rds') #read back in
+forest_fit |> metrics(truth = pos_neg_ratio, estimate = .pred)
+forest_metrics <- forest_fit |> metrics(truth = pos_neg_ratio, estimate = .pred)
+forest_metrics |> print()
+```
+
+```{r}
+ggplot(forest_fit, aes(x = pos_neg_ratio, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(color = "red", linetype = "dashed") +
+  labs(x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
+Wow! With an RSQ of almost 96%, this model is probably overfitting.
+
+## Boosted Tree
+
+For our last model we will be using a gradient boosted tree. For this we're going to be tuning `mtry`, `tree`, and the `learn_rate`.
+
+```{r boosted-workflow}
+boosted_specs <- boost_tree(mtry = tune(), 
+                            trees = tune(), 
+                            learn_rate = tune()) |>
+  set_engine('xgboost') |>
+  set_mode('regression')
+
+boosted_flow <- workflow() |> 
+  add_model(boosted_specs) |>
+  add_recipe(recipe_forest)
+```
+
+```{r boosted-tune, eval=FALSE}
+boosted_grid <- grid_regular(mtry(range = c(45, 200)), 
+                             learn_rate(range = c(-10,-1)), 
+                             trees(range = c(50,400)), 
+                             levels = 5)
+
+boosted_res <- tune_grid(boosted_flow,
+                        resamples = folds,
+                        grid = boosted_grid,
+                        metrics = metric_set(rmse, rsq))
+write_rds(boosted_res, file = '~/PSTAT 131/boosted.rds')
+```
+
+```{r, include = FALSE}
+boosted_res <- read_rds(file = '~/PSTAT 131/boosted.rds') #read back in
+```
+
+```{r}
+boosted_best <- select_best(boosted_res, metric = "rmse")
+autoplot(boosted_res)
+boosted_best |> print()
+```
+
+It looks like an `mtry` of 19, 225 trees, and a `learn_rate` of .1 performed the best. Lets see how it well it performs.
+
+```{r, eval = FALSE}
+final_boosted_flow <- finalize_workflow(boosted_flow, boosted_best)
+boosted_fit <- fit(final_boosted_flow, train)  |> augment(new_data = train)
+write_rds(boosted_fit, file = '~/PSTAT 131/boosted_fit.rds')
+```
+
+```{r}
+boosted_fit <- read_rds(file = '~/PSTAT 131/boosted_fit.rds') #read back in
+boosted_metrics <- boosted_fit |> metrics(truth = pos_neg_ratio, estimate = .pred)
+boosted_metrics |> print()
+```
+
+```{r}
+ggplot(boosted_fit, aes(x = pos_neg_ratio, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(color = "red", linetype = "dashed") +
+  labs(x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
+It looks like the gradient boosted forest isn't doing too bad, with an RSQ of 73.9%.
+
+## The Final Fit
+
+With these five model types fit, it's time to apply the best particular model to the testing set. Let's observe our RMSE and RSQ for each type we tried.
+
+```{r}
+lm_metrics
+knn_metrics
+elastic_metrics
+forest_metrics
+boosted_metrics
+```
+
+Our "best" model was a random forest with an `mtry` of 45, 200 `trees`, and a `min_n` of 2. The gradient boosted tree model came in second, close enough to where I am willing to try it on the test set too. Let's finally see how well our best models perform.
+
+```{r, eval = FALSE}
+forest_preds <- last_fit(final_forest_flow, split = split)
+write_rds(forest_preds, file = '~/PSTAT 131/forest_final.rds')
+```
+
+```{r forest-test-eval}
+forest_preds <- read_rds(file = '~/PSTAT 131/forest_final.rds')
+forest_preds |> collect_metrics() |> print()
+ggplot(forest_preds |> collect_predictions(), aes(x = pos_neg_ratio, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(color = "red", linetype = "dashed") +
+  labs(x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
+```{r, eval = FALSE}
+boosted_preds <- last_fit(final_boosted_flow, split = split)
+write_rds(boosted_preds, file = '~/PSTAT 131/boosted_final.rds')
+```
+
+```{r boosted-test-eval}
+boosted_preds <- read_rds(file = '~/PSTAT 131/boosted_final.rds')
+boosted_preds |> collect_metrics() |> print()
+
+ggplot(boosted_preds |> collect_predictions(), aes(x = pos_neg_ratio, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(color = "red", linetype = "dashed") +
+  labs(x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
+```{r, include = FALSE, eval = FALSE}
+stopCluster(cl)
+```
+
+That's disappointing. Our random forest model achieved an RSQ of 34.5%, and our gradient boosted model got 35.7%. My suspicion about overfitting for the random forest seemed to be correct, but I am more surprised about the boosted tree's bad performance.
+
+# Conclusion
+
+Overall, I wanted to be able to numerically predict how well received a given game is on Steam. After tuning and fitting these 5 model types, I would generally consider this as a work in progress. Despite the limited success of the models, I have learned an immense amount about this data set, and fitting models to it. Now that we've fit some of these models and seen their results, lets talk about what went wrong.
+
+## What Went Wrong?
+
+KNN and elastic net proved to be very limited in their ability to predict anything. This was because both models are inherently not suited for this data set. For KNN, the massive number of predictors as a result of tokenizing the categorical variables led to a strong example of the curse of dimensionality. I am glad that I ventured into trying PCA to combat this, but overall it still did not make up for the aforementioned issue. Elastic net suffered from wanting a very tiny penalty, suggesting that OLS was better suited than elastic itself. For context, in actually coding this project I did elastic net *first*, and had not yet discovered that lower penalty values were performing better when I fit linear regression. So, my discovery about the penalty did not get to pay off until after I had already fit elastic and linear regression. This led to elastic being effectively useless in prediction compared to the linear regression model.
+
+Aside from those two standout issues, I am not entirely sure where the predictions went wrong otherwise. But, I do have more ideas for handling the data set itself that may have made a difference.
+
+One example of this would be going all out with the number of predictors. I would do this by tokenizing **all** of the categorical variables (name, developer, publisher, etc.), down to the word. This would take an absolutely ridiculous amount of time to actually run and use, even with strict max_token limits, but I feel that it could potentially lead to a more robust model. An important piece of this idea is to utilize models that actually benefit, or at least don't fail, with the large number of predictors.
+
+Even with these ideas , there are many aspects of a video game that are simply not going to be specifically reflected through this data set. For instance, there are definitely not going to be any tags proclaiming that the graphics of a video game are not great. But, that would certainly have a bearing on the perception of the game itself. Similarly, what if a game simply had a rough launch? That will definitely not be reflected clearly in the data, unless you are cross referencing with past and present versions of the data set (which we are not doing for now.)
+
+Outside of any complex methods that may or may not help certain models, the most obvious improvement would be to try even more model types. There are multitudes of models that I did not even try, and even more that I haven't looked into yet. With time, I will learn more about these models and be able to try increasingly complex methods. For now though, I will take what I have learned from these five.
+
+#### Sources
+
+Martin Bustos, 2026. "Steam Games Dataset" [Data set]. Kaggle. <https://www.kaggle.com/datasets/fronkongames/steam-games-dataset?select=games.csv>
